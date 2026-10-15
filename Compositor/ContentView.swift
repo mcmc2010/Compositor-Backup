@@ -185,7 +185,7 @@ struct ContentView: View {
                     .disabled(session.isImporting || session.showsBusy || session.levels != nil)
                     .modifier(NewProjectDropTarget(workspace: applicationDelegate?.workspace))
             }
-            ToolbarSpacer(.fixed, placement: .navigation)
+            ToolbarGap(fixed: true)
             if let workspace = applicationDelegate?.workspace {
                 ToolbarItem(placement: .navigation) {
                     ProjectTabStrip(workspace: workspace)
@@ -194,11 +194,11 @@ struct ContentView: View {
                         // strip scrolls instead.
                         .frame(width: max(200, windowWidth - 352), height: 34, alignment: .center)
                 }
-                .sharedBackgroundVisibility(.hidden)
+                .hiddenSharedBackground()
             }
             // Absorb all remaining navigation-toolbar width before the zoom controls.
             // Without this spacer, the growing tab strip pushes the primary actions left.
-            ToolbarSpacer(.flexible, placement: .navigation)
+            ToolbarGap(fixed: false)
             ToolbarItem(placement: .primaryAction) {
                 Button("Fit") { session.fit() }.help("Fit canvas in window (⌘0)")
                     .accessibilityIdentifier("fitCanvas").disabled(session.document == nil)
@@ -372,6 +372,28 @@ struct ContentView: View {
 }
 
 /// A panel's divider that resizes the panel to its right: drag left to widen, right to narrow, within `range`.
+/// `ToolbarSpacer` is macOS 26 API; before it, the toolbar simply has no spacer.
+private struct ToolbarGap: ToolbarContent {
+    let fixed: Bool
+    var body: some ToolbarContent {
+        if #available(macOS 26.0, *) {
+            ToolbarSpacer(fixed ? .fixed : .flexible, placement: .navigation)
+        }
+    }
+}
+
+private extension ToolbarContent {
+    /// `sharedBackgroundVisibility` is macOS 26 API; earlier systems keep the item's default background.
+    @ToolbarContentBuilder
+    func hiddenSharedBackground() -> some ToolbarContent {
+        if #available(macOS 26.0, *) {
+            self.sharedBackgroundVisibility(.hidden)
+        } else {
+            self
+        }
+    }
+}
+
 private struct PanelResizeEdge: View {
     @Binding var width: Double
     let range: ClosedRange<Double>
