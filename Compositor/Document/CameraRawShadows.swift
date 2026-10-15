@@ -55,7 +55,14 @@ nonisolated enum CameraRawShadows {
         let (low, lower) = points[index], (high, upper) = points[index + 1]
         let t = Float((value - low) / (high - low))
         let count = tables.coefficients[set][0].count
-        return (0..<count).map { i in (lower?[i] ?? 0) * (1 - t) + (upper?[i] ?? 0) * t }
+        let keep: Float = 1 - t
+        var blended = [Float](repeating: 0, count: count)
+        for i in 0..<count {
+            let a: Float = lower?[i] ?? 0
+            let b: Float = upper?[i] ?? 0
+            blended[i] = a * keep + b * t
+        }
+        return blended
     }
 
     /// Runs Shadows at `amount` over 8-bit premultiplied RGBA. `scale` is pixels here per layer pixel, so a preview
