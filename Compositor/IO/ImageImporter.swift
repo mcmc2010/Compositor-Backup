@@ -122,7 +122,8 @@ actor ImageImporter {
             guard let page = document.page(at: number) else { throw ImageImportError.unreadable }
             let box = page.getBoxRect(.cropBox)
             let size = abs(page.rotationAngle % 180) == 90 ? CGSize(width: box.height, height: box.width) : box.size
-            let scale = fitting.map { min($0.width / size.width, $0.height / size.height) } ?? Self.pdfResolution / 72
+            let scale: CGFloat = fitting.map { min($0.width / size.width, $0.height / size.height) }
+                ?? CGFloat(Self.pdfResolution / 72)
             let width = Int((size.width * scale).rounded()), height = Int((size.height * scale).rounded())
             guard width >= 1, height >= 1, width <= DocumentLimits.maxSide, height <= DocumentLimits.maxSide,
                   width * height <= remaining else { throw ImageImportError.tooLarge }

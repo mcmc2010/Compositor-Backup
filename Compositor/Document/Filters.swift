@@ -313,8 +313,8 @@ nonisolated enum PixelFilter {
             // Rows run top-down here, so up on screen is a smaller row.
             direction: SIMD2(Float(cos(angle)), Float(-sin(angle))),
             distance: Float(distance), blur: Float(blur), reach: Float(reach), radial: settings.rgbSplitRadial ? 1 : 0,
-            sides: (sides.contains(.left) ? 1 : 0) | (sides.contains(.right) ? 2 : 0) | (sides.contains(.top) ? 4 : 0)
-                | (sides.contains(.bottom) ? 8 : 0),
+            sides: UInt32(sides.contains(.left) ? 1 : 0) | UInt32(sides.contains(.right) ? 2 : 0) | UInt32(sides.contains(.top) ? 4 : 0)
+                | UInt32(sides.contains(.bottom) ? 8 : 0),
             spectral: distance > 0 ? UInt32(min(32, max(3, Int(spread)))) : 1,
             smear: blur > 0 ? UInt32(min(24, max(2, Int(smear / 2)))) : 1))
         guard let image = context.makeImage() else { throw ExportError.render }

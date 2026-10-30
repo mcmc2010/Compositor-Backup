@@ -151,7 +151,7 @@ struct LayersHeader: View {
                 get: { session.layerTypeFilter.isEmpty },
                 set: { on in if on { session.clearLayerTypeFilter() } }
             ))
-            .labelReservedIconWidth(16)
+            .reservedLabelIconWidth(16)
             .accessibilityIdentifier("layerFilterAll")
             Divider()
             ForEach(LayerType.allCases.filter { $0 != .selected }, id: \.self) { typeToggle($0) }
@@ -166,7 +166,7 @@ struct LayersHeader: View {
             get: { session.layerTypeFilter.contains(kind) },
             set: { on in if on { session.layerTypeFilter.insert(kind) } else { session.layerTypeFilter.remove(kind) } }
         ))
-        .labelReservedIconWidth(16)
+        .reservedLabelIconWidth(16)
         .accessibilityLabel(kind.filterLabel)
         .accessibilityIdentifier(kind.accessibilityID)
     }
@@ -245,6 +245,18 @@ private struct PlainSearchText: NSViewRepresentable {
                 (control as? NSTextField)?.stringValue = ""
             }
             return true
+        }
+    }
+}
+
+private extension View {
+    /// `labelReservedIconWidth` is macOS 26 API; earlier systems lay the label out as they always did.
+    @ViewBuilder
+    func reservedLabelIconWidth(_ width: CGFloat) -> some View {
+        if #available(macOS 26.0, *) {
+            self.labelReservedIconWidth(width)
+        } else {
+            self
         }
     }
 }
