@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreImage
 import Foundation
 import ImageIO
 import Testing
@@ -30,6 +31,30 @@ struct VolumetricLightTests {
         let bytes = try #require(context.data).assumingMemoryBound(to: UInt8.self)
         let at = y * context.bytesPerRow + x * 4
         return (Int(bytes[at]) + Int(bytes[at + 1]) + Int(bytes[at + 2])) / 3
+    }
+
+    /// The first time, the first preview waits for the depth model rather than guessing and then jumping to the depth
+    /// a moment later, even as the panel opening sets its sliders; once the model is here (or can't be had: here, from
+    /// a folder without it), it draws.
+    @MainActor @Test func theFirstPreviewWaitsForTheDepthModel() async throws {
+        guard !DepthModel.isReady else { return }   // loaded already by another test: nothing to wait for
+        let source = DepthModel.source
+        defer { DepthModel.source = source }
+        DepthModel.source = FileManager.default.temporaryDirectory.appendingPathComponent("no-depth-model-\(UUID().uuidString)/")
+        let session = EditorSession()
+        session.createDocument(width: width, height: height, emptyLayer: true)
+        let image = try room()
+        session.insert(ImportedImage(image: image, thumbnail: image, name: "Room"))
+        session.beginFilter(.volumetricLight)
+        let edit = try #require(session.filterEdit)
+        #expect(session.preparingDepth && edit.previewTask == nil && edit.preparedPreview == nil, "no preview yet")
+        // The panel's sliders write their values back as it opens: no change, so still nothing drawn.
+        session.updateFilter(edit.settings, preview: edit.preview)
+        #expect(edit.previewTask == nil && edit.preparedPreview == nil, "still no preview")
+        while session.preparingDepth { try await Task.sleep(for: .milliseconds(20)) }
+        while edit.previewTask != nil || edit.preparedPreview == nil { try await Task.sleep(for: .milliseconds(20)) }
+        #expect(edit.preparedPreview != nil)
+        session.cancelFilter()
     }
 
     @Test func theLightStartsOnTheBrightestSpot() throws {
@@ -71,6 +96,109 @@ struct VolumetricLightTests {
         #expect(corner < open - 10, "the far corner gets less than near the window: \(corner) against \(open)")
     }
 
+    /// Depth reaches the haze: everything near (1) leaves less haze than no depth at all, which guesses most of the frame
+    /// is far.
+    @Test func depthThinsTheHazeWhereThingsAreNear() throws {
+        let extent = CGRect(x: 0, y: 0, width: 64, height: 64)
+        let depthImage = DepthModel.image(DepthMap(values: [Float](repeating: 1, count: 16 * 16), width: 16, height: 16), over: extent)
+        #expect(depthImage.extent == extent, "the depth image covers the layer: \(depthImage.extent)")
+        let photo = CIImage(color: CIColor(red: 0.1, green: 0.1, blue: 0.1)).cropped(to: extent)
+        let clear = CIImage.black.cropped(to: extent)
+        var settings = VolumetricLightSettings()
+        settings.intensity = 0
+        settings.haze = 100
+        let context = CIContext()
+        func top(_ depth: CIImage?) throws -> Float {
+            let lit = try MetalVolumetricLight.combined(photo, beams: clear, near: clear, glows: clear, ambient: photo, depth: depth,
+                                                        ramp: (0, 0.5), light: CGPoint(x: 32, y: 32), side: 64, settings: settings)
+            var pixel = [Float](repeating: 0, count: 4)
+            context.render(lit, toBitmap: &pixel, rowBytes: 16, bounds: CGRect(x: 32, y: 60, width: 1, height: 1), format: .RGBAf, colorSpace: nil)
+            return pixel[0]
+        }
+        let guessed = try top(nil), near = try top(depthImage)
+        #expect(abs(near - guessed) > 0.01, "near: \(near), guessed far: \(guessed)")
+    }
+
+    /// Keep Subject Clear holds the subject near whatever the model says; off, a subject the model puts far away keeps
+    /// that depth, and so its haze.
+    @Test func keepSubjectClearHoldsTheSubjectNear() {
+        let extent = CGRect(x: 0, y: 0, width: 64, height: 64)
+        let far = DepthMap(values: [Float](repeating: 0.2, count: 16 * 16), width: 16, height: 16)
+        let subject = CIImage(color: .white).cropped(to: CGRect(x: 16, y: 16, width: 32, height: 32))
+            .composited(over: CIImage.black.cropped(to: extent))
+        let context = CIContext()
+        func middle(_ clear: Bool) -> Float {
+            let depth = VolumetricLighting.composedDepth(far, subject: subject, extent: extent, keepsSubjectClear: clear)
+            var pixel = [Float](repeating: 0, count: 4)
+            context.render(depth, toBitmap: &pixel, rowBytes: 16, bounds: CGRect(x: 32, y: 32, width: 1, height: 1), format: .RGBAf, colorSpace: nil)
+            return pixel[0]
+        }
+        let clear = middle(true), own = middle(false)
+        #expect(clear >= 0.89, "kept near: \(clear)")
+        #expect(abs(own - 0.2) < 0.05, "at its own depth: \(own)")
+    }
+
+    /// A crop's mask takes a narrow gap out of the outline, as between fingers, but not a wide part it left out, as a
+    /// chest behind a fist.
+    @Test func onlyNarrowGapsAreTakenOut() {
+        let extent = CGRect(x: 0, y: 0, width: 200, height: 200)
+        func box(_ rect: CGRect) -> CIImage {
+            CIImage(color: .white).cropped(to: rect).composited(over: CIImage.black.cropped(to: extent))
+        }
+        let outline = box(CGRect(x: 20, y: 20, width: 160, height: 160))
+        let left = [CGRect(x: 98, y: 40, width: 4, height: 120), CGRect(x: 130, y: 60, width: 40, height: 80)]
+        let seen = left.reduce(outline) { seen, rect in
+            CIImage.black.cropped(to: rect).composited(over: seen)
+        }
+        let gaps = VolumetricLighting.narrowGaps(in: outline, seen: seen, narrow: 6, extent: extent)
+        let context = CIContext()
+        func at(_ x: Int) -> Float {
+            var pixel = [Float](repeating: 0, count: 4)
+            context.render(gaps, toBitmap: &pixel, rowBytes: 16, bounds: CGRect(x: x, y: 100, width: 1, height: 1), format: .RGBAf, colorSpace: nil)
+            return pixel[0]
+        }
+        let narrow = at(100), wide = at(150), edge = at(131), body = at(60)
+        #expect(narrow > 0.9, "the narrow gap is taken out: \(narrow)")
+        #expect(wide < 0.1 && edge < 0.1, "the wide part stays, to its edge: \(wide), \(edge)")
+        #expect(body < 0.1, "the rest stays: \(body)")
+    }
+
+    /// Depth Contrast spreads bunched depths apart and keeps their order; 0 leaves them.
+    @Test func depthContrastSpreadsBunchedDepths() {
+        let bunched = DepthMap(values: [0, 0.01, 0.02, 0.03, 1], width: 5, height: 1)
+        #expect(bunched.equalized(0).values == bunched.values)
+        let spread = bunched.equalized(1).values
+        #expect(spread == [0, 0.25, 0.5, 0.75, 1], "evenly by rank: \(spread)")
+        let half = bunched.equalized(0.5).values
+        #expect(half == half.sorted() && half[2] > 0.2, "half way, in the same order: \(half)")
+    }
+
+    /// Times the filter at preview size as Haze moves, for `VOLUMETRIC_TIMING` (an image path). Skipped when unset.
+    @Test func timeHazeChanges() async throws {
+        guard let path = ProcessInfo.processInfo.environment["VOLUMETRIC_TIMING"],
+              let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+              let full = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return }
+        if let folder = ProcessInfo.processInfo.environment["VOLUMETRIC_DEPTH"] {
+            DepthModel.source = URL(fileURLWithPath: folder, isDirectory: true)
+            _ = await DepthModel.prepare()
+        }
+        // At the preview's size, 2048 on the long side.
+        let scale = 2048 / Double(max(full.width, full.height))
+        let context = try BrushRaster.context(width: Int(Double(full.width) * scale), height: Int(Double(full.height) * scale), mask: false)
+        BrushRaster.draw(full, in: CGRect(x: 0, y: 0, width: context.width, height: context.height), mask: false, context: context)
+        let image = try #require(context.makeImage())
+        var settings = FilterSettings()
+        settings.volumetric.center = CGPoint(x: Double(image.width) / 2, y: Double(image.height) * 0.1)
+        var times: [Double] = []
+        for haze in stride(from: 40.0, through: 80, by: 5) {
+            settings.volumetric.haze = haze
+            let start = Date()
+            _ = try PixelFilter.run(FilterJob(kind: .volumetricLight, image: image, settings: settings, scale: 1, selection: nil, mapping: .identity))
+            times.append(Date().timeIntervalSince(start) * 1000)
+        }
+        Attachment.record("\(image.width)x\(image.height) ms per Haze step: \(times.map { Int($0) }) depth \(DepthModel.isReady)", named: "timing.txt")
+    }
+
     @Test func zeroIntensityAndHazeLeaveTheImage() throws {
         var settings = VolumetricLightSettings()
         settings.intensity = 0
@@ -80,8 +208,31 @@ struct VolumetricLightTests {
 
     /// Renders the photos in `VOLUMETRIC_IMAGES` ("path,x,y" separated by ";", the light as fractions of the width and
     /// height from the top left) as attachments, to look at. Skipped when it's unset.
-    @Test func renderSamples() throws {
+    /// With `VOLUMETRIC_DEPTH` set to a folder laid out as the release is, each is rendered twice: guessing depth, then
+    /// with the depth model downloaded from there ("-a" and "-b").
+    @Test func renderSamples() async throws {
         guard let list = ProcessInfo.processInfo.environment["VOLUMETRIC_IMAGES"] else { return }
+        try render(list, suffix: "")
+        if let folder = ProcessInfo.processInfo.environment["VOLUMETRIC_DEPTH"] {
+            DepthModel.source = URL(fileURLWithPath: folder, isDirectory: true)
+            #expect(await DepthModel.prepare(), "the model downloads, checks out and loads")
+            try render(list, suffix: "-b")
+            for (index, entry) in list.split(separator: ";").enumerated() {
+                let path = String(entry.split(separator: ",")[0])
+                guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+                      let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { continue }
+                let map = try #require(VolumetricLighting.depthMap(for: image, settings: VolumetricLightSettings()))
+                #expect(map.width == image.width && map.height == image.height)
+                let data = NSMutableData()
+                let destination = try #require(CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil))
+                CGImageDestinationAddImage(destination, map, nil)
+                CGImageDestinationFinalize(destination)
+                Attachment.record(data as Data, named: "sample-\(index)-depth-lit.png")
+            }
+        }
+    }
+
+    private func render(_ list: String, suffix: String) throws {
         for (index, entry) in list.split(separator: ";").enumerated() {
             let parts = entry.split(separator: ",").map(String.init)
             guard parts.count >= 3, let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: parts[0]) as CFURL, nil),
@@ -102,13 +253,14 @@ struct VolumetricLightTests {
             if parts.count >= 11, let r = Double(parts[8]), let g = Double(parts[9]), let b = Double(parts[10]) {
                 settings.volumetric.color = AdjustmentColor(red: r, green: g, blue: b)
             }
+            if parts.count >= 12, let distance = Double(parts[11]) { settings.volumetric.distance = distance }
             let lit = try PixelFilter.run(FilterJob(kind: .volumetricLight, image: image, settings: settings, scale: 1, selection: nil,
                                                     mapping: .identity))
             let data = NSMutableData()
             let destination = try #require(CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil))
             CGImageDestinationAddImage(destination, lit, nil)
             CGImageDestinationFinalize(destination)
-            Attachment.record(data as Data, named: "sample-\(index)-lit.png")
+            Attachment.record(data as Data, named: "sample-\(index)\(suffix)-lit.png")
         }
     }
 }

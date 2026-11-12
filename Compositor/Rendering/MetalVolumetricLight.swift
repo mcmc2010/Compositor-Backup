@@ -28,6 +28,11 @@ nonisolated final class MetalVolumetricLight: @unchecked Sendable {
         /// The image's height, and how far below its top the output's first row is, for how far away each row is.
         var height: Float = 1
         var top: Float = 0
+        /// 1 when there's a depth map to go by, 0 to guess from where a pixel sits.
+        var hasDepth: Float = 0
+        /// Where the haze begins and where it's full, as distance (0 nearest, 1 farthest; see `VolumetricLighting.ramp`).
+        var start: Float = 0
+        var end: Float = 1
     }
 
     private init() throws {
@@ -66,13 +71,17 @@ nonisolated final class MetalVolumetricLight: @unchecked Sendable {
     }
 
     /// `beams` and the haze over `image`: `near` says how near the subject each pixel is, `glows` is the photo's own
-    /// lights bloomed, and `ambient` its light spread wide.
-    static func combined(_ image: CIImage, beams: CIImage, near: CIImage, glows: CIImage, ambient: CIImage, light: CGPoint,
-                         side: CGFloat, settings: VolumetricLightSettings) throws -> CIImage {
+    /// lights bloomed, `ambient` its light spread wide, and `depth` how near each part is (1 nearest), if it's known.
+    static func combined(_ image: CIImage, beams: CIImage, near: CIImage, glows: CIImage, ambient: CIImage, depth: CIImage?,
+                         ramp: (start: Float, end: Float), light: CGPoint, side: CGFloat, settings: VolumetricLightSettings) throws -> CIImage {
         guard shared != nil else { throw ExportError.render }
         var parameters = parameters(settings, light: light, side: side)
+        parameters.start = ramp.start
+        parameters.end = max(ramp.end, ramp.start + 0.01)
         parameters.height = Float(image.extent.height)
-        return try VolumetricLightKernel.apply(withExtent: image.extent, inputs: [image, beams, near, glows, ambient],
+        parameters.hasDepth = depth == nil ? 0 : 1
+        let depth = depth ?? CIImage.black.cropped(to: image.extent)
+        return try VolumetricLightKernel.apply(withExtent: image.extent, inputs: [image, beams, near, glows, ambient, depth],
                                                arguments: ["parameters": withUnsafeBytes(of: parameters) { Data($0) },
                                                            "combine": true, "extent": image.extent])
     }
@@ -94,6 +103,9 @@ struct Parameters {
     float haze;
     float height;
     float top;
+    float hasDepth;
+    float start;
+    float end;
 };
 
 int2 offsetOf(constant Parameters &p, int input) {
@@ -157,8 +169,9 @@ kernel void volumetricBeams(texture2d<float, access::sample> image [[texture(0)]
     result.write(float4(gathered, gathered, gathered, 1.0), pixel);
 }
 
-// The haze: thicker the further away a pixel is, which is guessed from where it sits (the foot of the frame is the
-// ground near the camera, higher up is further off) and the subject (nearer than what's behind it). It veils the
+// The haze: thicker the further away a pixel is, from the depth model once it's here (the subject held near by its
+// mask), otherwise guessed from where it sits (the foot of the frame is the ground near the camera, higher up is
+// further off) and the subject (nearer than what's behind it). It veils the
 // photo in the air's color, lit by the scene itself and more toward the light, and the photo's own lights glow into
 // it. Then the beams are screened over, a lot of them rolling off into the light's color and white rather than clipping.
 kernel void volumetricCombine(texture2d<float, access::sample> image [[texture(0)]],
@@ -166,7 +179,8 @@ kernel void volumetricCombine(texture2d<float, access::sample> image [[texture(0
                               texture2d<float, access::sample> near [[texture(2)]],
                               texture2d<float, access::sample> glows [[texture(3)]],
                               texture2d<float, access::sample> ambient [[texture(4)]],
-                              texture2d<float, access::write> result [[texture(5)]],
+                              texture2d<float, access::sample> depth [[texture(5)]],
+                              texture2d<float, access::write> result [[texture(6)]],
                               constant Parameters &p [[buffer(0)]],
                               uint2 pixel [[thread_position_in_grid]]) {
     if (pixel.x >= result.get_width() || pixel.y >= result.get_height()) return;
@@ -177,13 +191,23 @@ kernel void volumetricCombine(texture2d<float, access::sample> image [[texture(0
     float front = clamp(texel(near, here + offsetOf(p, 2)).r, 0.0, 1.0);
     float3 bloom = max(float3(0), texel(glows, here + offsetOf(p, 3)).rgb);
     float3 air = max(float3(0), texel(ambient, here + offsetOf(p, 4)).rgb);
-    float down = (p.top + float(pixel.y) + 0.5) / max(1.0, p.height);
-    float far = (1.0 - smoothstep(0.45, 1.05, down)) * (1.0 - 0.8 * front);
+    float far;
+    if (p.hasDepth > 0.5) {
+        // The depth map, which already has the subject in it, edge and all (`VolumetricLighting.composedDepth`).
+        far = 1.0 - clamp(texel(depth, here + offsetOf(p, 5)).r, 0.0, 1.0);
+    } else {
+        // No depth: guessed from where it sits (the foot of the frame is the ground near the camera) and the subject.
+        float down = (p.top + float(pixel.y) + 0.5) / max(1.0, p.height);
+        far = (1.0 - smoothstep(0.45, 1.05, down)) * (1.0 - 0.8 * front);
+    }
     float glow = exp(-length(float2(pixel) + 0.5 - p.light) / (p.side * 0.35));
-    float fog = 1.0 - exp(-2.2 * p.haze * (0.2 + 0.8 * far));
+    // Clear nearer than where Distance starts the haze, building to full over a gentle stretch beyond.
+    float ramp = smoothstep(p.start, p.end, far);
+    // A little haze even in front: there's air between the camera and the nearest thing too.
+    float fog = 1.0 - exp(-3.0 * p.haze * (0.12 + 0.88 * ramp));
     float3 fogColor = air * mix(float3(1.0), p.tint.rgb, 0.6) * 0.9 + p.tint.rgb * glow * 0.45;
     float3 base = max(float3(0), color.rgb / color.a);
-    float3 veiled = mix(base, fogColor, fog) + bloom * p.haze * 1.6 * (0.3 + 0.7 * far);
+    float3 veiled = mix(base, fogColor, fog) + bloom * p.haze * 1.6 * (0.3 + 0.7 * ramp);
     float3 added = p.color.rgb * gathered * 0.5 * (1.0 - 0.92 * front);
     float3 lit = 1.0 - (1.0 - min(veiled, float3(1.0))) * exp(-added);
     // Light past white in an HDR layer stays past it.
@@ -208,7 +232,7 @@ final class VolumetricLightKernel: CIImageProcessorKernel {
 
     override class func process(with inputs: [CIImageProcessorInput]?, arguments: [String: Any]?,
                                 output: CIImageProcessorOutput) throws {
-        guard let inputs, inputs.count == 3 || inputs.count == 5, let destination = output.metalTexture,
+        guard let inputs, inputs.count == 3 || inputs.count == 6, let destination = output.metalTexture,
               let command = output.metalCommandBuffer, let gpu = MetalVolumetricLight.shared,
               let data = arguments?["parameters"] as? Data, data.count >= MemoryLayout<MetalVolumetricLight.Parameters>.size,
               let encoder = command.makeComputeCommandEncoder() else { throw ExportError.render }
